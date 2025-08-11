@@ -1,0 +1,192 @@
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 3.113.0"
+    }
+    azapi = {
+      source  = "azure/azapi"
+      version = ">= 1.13.0"
+    }
+  }
+}
+
+
+
+locals {
+  use_patch = lower(var.zone_redundancy_mode) == "patch"
+}
+
+# AzureRM resource remains the owner of the Redis instance.
+resource "azurerm_redis_cache" "this" {
+  name                = var.name
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  sku_name = var.sku_name
+  family   = var.family
+  capacity = var.capacity
+
+  minimum_tls_version = var.minimum_tls_version
+  enable_non_ssl_port = var.enable_non_ssl_port
+
+  # INTENTIONAL: no subnet_id (no VNet injection)
+  # INTENTIONAL: no geo-replication blocks
+
+  tags = var.tags
+
+  lifecycle {
+    prevent_destroy = var.prevent_destroy
+
+    precondition {
+      condition     = var.allow_vnet_integration == false
+      error_message = "VNet injection is not supported by this module. Set allow_vnet_integration=false."
+    }
+
+    precondition {
+      condition     = var.enable_geo_replication == false
+      error_message = "Geo-replication is intentionally not supported by this module. Set enable_geo_replication=false."
+    }
+  }
+}
+
+# Optional AzAPI PATCH to enable platform-managed zone allocation policy (in-place change).
+resource "azapi_update_resource" "zonal_allocation_policy" {
+  for_each    = local.use_patch ? { this = azurerm_redis_cache.this.id } : {}
+  type        = "Microsoft.Cache/redis@${var.azapi_api_version}"
+  resource_id = azurerm_redis_cache.this.id
+  method      = "PATCH"
+
+  body = jsonencode({
+    properties = {
+      # This property enables platform-managed multi-zone placement where supported.
+      # It is an in-place change and should not recreate the resource.
+      zonalAllocationPolicy = "Automatic"
+    }
+  })
+
+  # After the PATCH, read back the property and assert it's set.
+  lifecycle {
+    postcondition {
+      condition = try(jsondecode(data.azapi_resource.redis_read["this"].output).properties.zonalAllocationPolicy, null) == "Automatic"
+      error_message = "Expected properties.zonalAllocationPolicy to be 'Automatic' after AzAPI patch, but it wasn't."
+    }
+  }
+
+  depends_on = [azurerm_redis_cache.this]
+}
+
+# Read the resource to verify the applied setting (only when patching)
+data "azapi_resource" "redis_read" {
+  for_each    = local.use_patch ? { this = azurerm_redis_cache.this.id } : {}
+  type        = "Microsoft.Cache/redis@${var.azapi_api_version}"
+  resource_id = azurerm_redis_cache.this.id
+
+  # Export only what we need
+  response_export_values = ["properties.zonalAllocationPolicy"]
+}
+
+
+
+
+variable "name" {
+  description = "Name of the Redis Cache (must be globally unique)."
+  type        = string
+}
+
+variable "resource_group_name" {
+  description = "Resource group name."
+  type        = string
+}
+
+variable "location" {
+  description = "Azure region."
+  type        = string
+}
+
+# SKU settings (avoid Basic as per guardrails)
+variable "sku_name" {
+  description = "Redis SKU name: Standard, Premium, or Enterprise (avoid Basic)."
+  type        = string
+  validation {
+    condition     = lower(var.sku_name) != "basic"
+    error_message = "Basic SKU is not allowed by this module."
+  }
+}
+
+# 'C' for Standard, 'P' for Premium, 'E' for Enterprise
+variable "family" {
+  description = "SKU family: C (Standard), P (Premium), or E (Enterprise)."
+  type        = string
+  validation {
+    condition     = contains(["C","P","E","c","p","e"], var.family)
+    error_message = "family must be one of: C, P, E."
+  }
+}
+
+variable "capacity" {
+  description = "SKU capacity. For Standard/Premium this is typically 0..6; for Enterprise use the appropriate number per SKU."
+  type        = number
+}
+
+variable "minimum_tls_version" {
+  description = "Minimum TLS version. 1.2 is recommended."
+  type        = string
+  default     = "1.2"
+}
+
+variable "enable_non_ssl_port" {
+  description = "Whether to enable the non-SSL port (6379). Strongly discouraged."
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  description = "Resource tags."
+  type        = map(string)
+  default     = {}
+}
+
+# Guardrails toggles (must remain false)
+variable "allow_vnet_integration" {
+  description = "Must remain false. VNet injection is intentionally not supported by this module."
+  type        = bool
+  default     = false
+}
+
+variable "enable_geo_replication" {
+  description = "Must remain false. Geo-replication is intentionally not supported by this module."
+  type        = bool
+  default     = false
+}
+
+# Zone redundancy control
+variable "zone_redundancy_mode" {
+  description = "Zone redundancy mode: 'off' (no change), 'patch' (use AzAPI to set zonalAllocationPolicy=Automatic), or 'native' (no-op placeholder if/when azurerm supports it directly)."
+  type        = string
+  default     = "off"
+  validation {
+    condition     = contains(["off", "patch", "native"], lower(var.zone_redundancy_mode))
+    error_message = "zone_redundancy_mode must be one of: off | patch | native."
+  }
+}
+
+variable "azapi_api_version" {
+  description = "API version for Microsoft.Cache/redis used by AzAPI update/read."
+  type        = string
+  default     = "2024-03-01"
+}
+
+variable "prevent_destroy" {
+  description = "Add lifecycle.prevent_destroy to the Redis resource."
+  type        = bool
+  default     = true
+}
+
+variable "output_access_keys" {
+  description = "If true, output the primary access key (sensitive)."
+  type        = bool
+  default     = false
+}
